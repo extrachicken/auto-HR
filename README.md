@@ -25,20 +25,15 @@
 
 ## Установка и настройка
 
-1. **Установите необходимые библиотеки**:
-   ```bash
-   pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 openai requests flask
-   ```
-
-2. **Настройте учетные данные**:
+1. **Настройте учетные данные**:
    - Получите учетные данные для Google Sheets API и сохраните их в файл `creds.json`.
    - Укажите API ключи для OpenAI и Typeform в переменных окружения или в `settings.py`.
 
-3. **Настройте Google Sheets**:
+2. **Настройте Google Sheets**:
    - Убедитесь, что у вас есть доступ к Google Sheets с данными.
    - Укажите имена листов и идентификаторы столбцов в `settings.py`.
 
-4. **Настройте Typeform**:
+3. **Настройте Typeform**:
    - Проверьте доступ к Typeform API и укажите правильный API ключ в `settings.py`.
 
 ## Использование
