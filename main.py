@@ -1,164 +1,133 @@
-"""
-Главная точка входа: объединяет все части json и отправляет форму в Typeform API.
-"""
-
-from flask import Request, jsonify
-from gpt_json import generate_jobdesc_questions_json
-from must_haves_json import generate_musthaves_questions_json
-from constants_json import get_constants_fields_and_thankyou
-from sheets_utils import read_row, write_questions_to_sheet, write_form_link_to_sheet
-from settings import REDIRECT_URL, OPENAI_API_KEY, TYPEFORM_API_KEY
-import requests
 import logging
+from flask import jsonify, Request, redirect
+from urllib.parse import parse_qs, urlparse
+import json
 import re
+from settings import PROCESS_SUBMISSION_URL, SUCCESS_URL, FAIL_URL
 
-logger = logging.getLogger("main_gcf")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("process_submission")
 
-# TODO: интеграция с Google Sheets для получения job_description, must_haves, budget
-# TODO: интеграция с OpenAI API (OPENAI_API_KEY)
-# TODO: интеграция с Typeform API (TYPEFORM_API_KEY)
 
-def extract_budget_and_currency(must_haves):
-    for line in must_haves.split('\n'):
-        if 'бюджет' in line.lower() or 'budget' in line.lower() or 'salary' in line.lower():
-            # Сначала ищем число
-            num_match = re.search(r'([\d\s.,]+)', line)
-            if num_match:
-                amount_str = num_match.group(1)
-                amount_str = amount_str.replace(' ', '').replace(',', '').replace('..', '.')
-                try:
-                    if '.' in amount_str:
-                        amount = float(amount_str)
-                    else:
-                        amount = int(amount_str)
-                except Exception:
-                    amount = 0
-                # Теперь ищем валюту — первое слово после числа
-                after_num = line[num_match.end():].strip()
-                cur_match = re.match(r'([a-zA-Zа-яА-Я$€₽]+)', after_num)
-                currency = cur_match.group(1) if cur_match else ''
-                return amount, currency
-    return None, None
 
-def extract_questions_text(jobdesc_fields, musthave_fields, constants_fields):
+# --- Cloud Function ---
+def validate_must_haves(must_haves_text, form_data):
     """
-    Извлекает все вопросы из полей формы и объединяет их в одну строку.
+    Валидирует must-have параметры на основе ответов из формы.
+    Возвращает True если все требования выполнены, False иначе.
+    Особое правило: если есть вопрос budget_accept, именно его ответ считается must-have по бюджету.
     """
-    all_fields = jobdesc_fields + musthave_fields + constants_fields
-    questions = []
+    logger.info(f"Валидация must-haves: {must_haves_text}")
+    logger.info(f"Ответы формы: {form_data}")
     
-    for i, field in enumerate(all_fields, 1):
-        title = field.get('title', '')
-        field_type = field.get('type', '')
-        
-        # Добавляем номер вопроса и заголовок
-        question_text = f"{i}. {title}"
-        
-        # Если есть варианты ответов, добавляем их
-        if field_type == 'multiple_choice' and 'properties' in field and 'choices' in field['properties']:
-            choices = field['properties']['choices']
-            choice_labels = [choice.get('label', '') for choice in choices]
-            if choice_labels:
-                question_text += f" ({', '.join(choice_labels)})"
-        
-        questions.append(question_text)
+    # Парсим must-haves из текста
+    must_have_list = [line.strip('-•: .').strip() for line in must_haves_text.split('\n') if line.strip()]
     
-    return '\n'.join(questions)
+    # Проверяем каждый must-have параметр
+    for requirement in must_have_list:
+        if not requirement:
+            continue
+        # Особая обработка для бюджета
+        if 'бюджет' in requirement.lower() or 'budget' in requirement.lower():
+            answer = form_data.get('budget_accept')
+            logger.info(f"Проверка бюджета: requirement='{requirement}', answer='{answer}'")
+            if answer is None:
+                logger.warning("Нет ответа на вопрос budget_accept (подтверждение бюджета)")
+                return False
+            if str(answer).lower() in ['yes', 'да', 'true', '1']:
+                logger.info(f"✓ Требование по бюджету подтверждено (budget_accept: {answer})")
+                continue
+            else:
+                logger.warning(f"✗ Требование по бюджету НЕ выполнено (budget_accept: {answer})")
+                return False
+        # Обычная проверка для остальных must-have
+        found_match = False
+        for field_ref, answer in form_data.items():
+            logger.info(f"Проверка musthave: requirement='{requirement}', field_ref='{field_ref}', answer='{answer}'")
+            if 'musthave' in field_ref.lower():
+                if str(answer).lower() in ['yes', 'да', 'true', '1']:
+                    found_match = True
+                    logger.info(f"✓ Требование '{requirement}' выполнено (field_ref: {field_ref}, answer: {answer})")
+                    break
+                else:
+                    logger.warning(f"✗ Требование '{requirement}' НЕ выполнено (field_ref: {field_ref}, answer: {answer})")
+                    return False
+        if not found_match and not ('бюджет' in requirement.lower() or 'budget' in requirement.lower()):
+            logger.warning(f"⚠ Требование '{requirement}' не найдено в ответах формы")
+            return False
+    return True
 
-def build_typeform_json(jobdesc_fields, musthave_fields, constants_fields, thankyou_screens, logic):
+def extract_form_data(url_params):
     """
-    Собирает финальный JSON для Typeform из всех частей.
+    Извлекает данные формы из URL параметров Typeform.
     """
-    fields = jobdesc_fields + musthave_fields + constants_fields
-    typeform_json = {
-        "title": "Автоматическая форма найма",
-        "type": "quiz",
-        "workspace": {
-            "href": "https://api.typeform.com/workspaces/LGttCw"
-        },
-        "theme": {
-            "href": "https://api.typeform.com/themes/qHWOQ7"
-        },
-        "fields": fields,
-        "logic": logic,
-        "thankyou_screens": thankyou_screens,
-        "settings": {
-            "language": "en",
-            "progress_bar": "proportion",
-            "meta": {
-                "allow_indexing": False
-            },
-            "hide_navigation": True,
-            "is_public": True,
-            "is_trial": False,
-            "show_progress_bar": True,
-            "show_typeform_branding": False,
-            "are_uploads_public": False,
-            "show_time_to_complete": True,
-            "show_number_of_submissions": False,
-            "show_cookie_consent": False,
-            "show_question_number": True,
-            "show_key_hint_on_choices": False,
-            "autosave_progress": True,
-            "free_form_navigation": True,
-            "use_lead_qualification": False,
-            "pro_subdomain_enabled": False,
-            "auto_translate": True,
-            "partial_responses_to_all_integrations": True
-        }
-    }
-    return typeform_json
+    form_data = {}
+    
+    # Typeform передает данные в формате field:ref=value
+    for key, value in url_params.items():
+        if ':' in key:
+            field_type, field_ref = key.split(':', 1)
+            form_data[field_ref] = value[0] if isinstance(value, list) else value
+        else:
+            form_data[key] = value[0] if isinstance(value, list) else value
+    
+    return form_data
 
-def send_to_typeform(typeform_json, typeform_api_key):
-    url = "https://api.typeform.com/forms"
-    headers = {
-        "Authorization": f"Bearer {typeform_api_key}",
-        "Content-Type": "application/json"
-    }
-    response = requests.post(url, headers=headers, json=typeform_json)
-    if not response.ok:
-        logger.error(f"Ошибка Typeform API: {response.status_code} {response.text}")
-        response.raise_for_status()
-    data = response.json()
-    logger.info(f"Форма успешно создана: {data.get('id')}")
-    return data.get("_links", {}).get("display")
-
-def create_typeform(request: Request):
+def process_submission(request: Request):
+    """
+    Обрабатывает данные из формы Typeform и выполняет финальную валидацию.
+    """
+    logger.info("Получен запрос на обработку данных формы")
+    
     try:
+        # Получаем параметры из URL
         args = request.args
-        row_id = args.get("row_id")
-        if not row_id:
-            return jsonify({"error": "row_id обязателен"}), 400
-        job_description, must_haves = read_row(row_id)
-        must_haves_list = [line.strip('-•: .').strip() for line in must_haves.split('\n') if line.strip()]
-        budget, currency = extract_budget_and_currency(must_haves)
-        with open("prompt.md", encoding="utf-8") as f:
-            prompt = f.read()
-        jobdesc_fields = generate_jobdesc_questions_json(job_description, prompt, OPENAI_API_KEY, must_haves)
-        musthave_fields, logic = generate_musthaves_questions_json(must_haves_list, job_description, budget, currency)
-        constants_fields, thankyou_screens = get_constants_fields_and_thankyou(REDIRECT_URL, job_description, must_haves)
-        typeform_json = build_typeform_json(jobdesc_fields, musthave_fields, constants_fields, thankyou_screens, logic)
         
-        # Отправляем форму в Typeform
-        form_url = send_to_typeform(typeform_json, TYPEFORM_API_KEY)
+        # Проверяем обязательные параметры
+        if 'pass' not in args:
+            return jsonify({"error": "Отсутствует параметр pass"}), 400
         
-        # Извлекаем вопросы из формы
-        questions_text = extract_questions_text(jobdesc_fields, musthave_fields, constants_fields)
+        pass_status = args.get('pass')
         
-        # Записываем вопросы в ячейку G{row_id}
-        write_questions_to_sheet(row_id, questions_text)
-        logger.info(f"Вопросы записаны в ячейку G{row_id}")
+        if pass_status != 'true':
+            logger.info("Кандидат не прошел предварительную проверку")
+            return jsonify({
+                "status": "rejected",
+                "message": "Кандидат не соответствует требованиям"
+            }), 200
         
-        # Записываем ссылку на форму в ячейку H{row_id}
-        write_form_link_to_sheet(row_id, form_url)
-        logger.info(f"Ссылка на форму записана в ячейку H{row_id}")
+        # Извлекаем данные формы
+        form_data = extract_form_data(args)
+        logger.info(f"Данные формы: {form_data}")
         
-        return jsonify({
-            "ok": True, 
-            "form_url": form_url,
-            "questions_written_to": f"G{row_id}",
-            "form_link_written_to": f"H{row_id}"
-        })
+        # Получаем must-haves
+        must_haves = args.get('must_haves', '')
+        if not must_haves:
+            logger.warning("Отсутствуют must-have параметры")
+            return jsonify({"error": "Отсутствуют must-have параметры"}), 400
+        
+        # Выполняем финальную валидацию
+        is_valid = validate_must_haves(must_haves, form_data)
+        
+        if is_valid:
+            logger.info("Кандидат прошел финальную валидацию")
+            # Здесь можно добавить логику для сохранения данных в БД
+            # или отправки уведомлений
+            
+            # Редирект на финальную ссылку
+            success_url = args.get('success_url', SUCCESS_URL)
+            actual_email = args.get('field:email', form_data.get('email', ''))
+            actual_phone = args.get('field:phone', form_data.get('phone', ''))
+            actual_name = args.get('field:name', form_data.get('name', ''))
+            
+            return redirect(success_url, code=302)
+        else:
+            logger.info("Кандидат не прошел финальную валидацию")
+            # Редирект на ссылку неудачи
+            fail_url = args.get('fail_url', FAIL_URL)
+            return redirect(fail_url, code=302)
+            
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        return jsonify({"error": str(e)}), 500 
+        logger.error(f"Ошибка обработки данных: {e}")
+        return jsonify({"error": str(e)}), 500
+
